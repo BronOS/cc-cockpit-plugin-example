@@ -8,7 +8,9 @@
 // refuses a manifest whose `api` major it does not know (src/shared/manifest.ts).
 //
 // The phase-1 host implements every member (src/host/ctx/). The page side of panels is the panel SDK
-// (src/sdk/panel.ts, loaded as `/__sdk/panel.js`).
+// (src/sdk/panel.ts, loaded as `/__sdk/panel.js`). A page that loads it also gets the app theme on
+// `:root` and the app's component stylesheet (`.cc-btn`, `.cc-row`, `.cc-field`, ...; `ccc guide
+// style`), adopted first and inside `@layer cc`, so any rule of the page's own wins over it.
 
 export const PLUGIN_API_VERSION = 1
 
@@ -19,7 +21,11 @@ export type Disposer = () => void
 
 /** The plugin's settings, validated against the manifest's JSON Schemas with defaults applied. */
 export interface PluginSettings {
-  /** This project's values (`contributes.settings.project`). */
+  /**
+   * This project's values (`contributes.settings.project`): per top-level field, the project's
+   * override, else the global value (set on the plugin's global settings page), else the schema
+   * default. An object field is overridden whole.
+   */
   readonly project: Readonly<Record<string, JsonValue>>
   /** App-wide values (`contributes.settings.app`). */
   readonly app: Readonly<Record<string, JsonValue>>
@@ -178,21 +184,82 @@ export interface PanelHeaderAction {
  */
 export type OverlaySize = 'default' | 'large' | 'full'
 
+/**
+ * What an overlay says about itself, on top of its kind (every kind takes these). An older app
+ * ignores keys it does not know, so check `typeof ctx.overlay.buttons === 'function'` before you
+ * rely on buttons from other plugins.
+ */
+export interface OverlayExtras {
+  /**
+   * What the overlay shows: `name` a plain noun (`^[a-z][a-z0-9-]{0,63}$`), `data` plain JSON of at
+   * most 4,096 characters. Other plugins' buttons are chosen by the name, and Discuss with Claude
+   * names it. Well-known: `file` `{ path, mime? }` (path relative to the project folder) and
+   * `inbox-item` `{ source, id }` (`source` the providing plugin's id).
+   */
+  type?: { name: string; data: JsonValue }
+  /** The opener's own buttons in the overlay's toolbar, at most 4; clicks reach `onButton`. */
+  buttons?: OverlayButton[]
+  /**
+   * html only (refused for another kind): when the loader goes. `'load'` (default): once the page
+   * has loaded and its port is up. `'manual'`: when the page calls `ccPanel.ready()`, for an opener
+   * that fetches first and posts the content after.
+   */
+  ready?: 'load' | 'manual'
+  /**
+   * Discuss with Claude: `{ tabId }` preselects that Claude tab of this window; `false` hides the
+   * button on this overlay. Absent: shown for an overlay with a `type` or an `onDiscuss` handler.
+   */
+  discuss?: { tabId?: string } | false
+}
+
+/** A button in an overlay's toolbar. `id` 1-40 of `A-Z a-z 0-9 . _ -`; `label` 1-40 characters of plain text. */
+export interface OverlayButton {
+  id: string
+  label: string
+  /** A core icon name (as for `PanelHeaderAction`) or a plugin-relative `.svg` path. */
+  icon?: string
+  primary?: boolean
+  disabled?: boolean
+  /** Shown as under way; clicks are ignored. */
+  busy?: boolean
+}
+
+/** What a plugin that adds buttons for an overlay type is told about the overlay. */
+export interface OverlayInfo {
+  readonly type: { readonly name: string; readonly data: JsonValue }
+  readonly title: string
+  /**
+   * The opening plugin's id, `'core'` or `'cli'`. Set by the app from the plugin whose request it
+   * accepted (never from the spec or its `type.data`), so a provider can trust it where it cannot
+   * trust `data`: a source adds its `inbox-item` buttons only on overlays it or the reviewer it handed
+   * the item to opened, so another plugin naming a thread of yours gets none. Plugins of one project
+   * share a JS realm, so this keeps out mistakes and opportunists, not deliberate impersonation.
+   */
+  readonly opener: string
+}
+
+/** A button another plugin adds to every overlay of a type; `run` gets the overlay's info on a click. */
+export interface OverlayTypeButton extends OverlayButton {
+  run: (overlay: OverlayInfo) => unknown | Promise<{ close?: true } | void>
+}
+
 export type OverlaySpec =
-  | { kind: 'terminal'; argv: string[]; cwd?: string; title?: string; size?: OverlaySize }
-  | { kind: 'url'; url: string; title?: string; size?: OverlaySize }
+  | ({ kind: 'terminal'; argv: string[]; cwd?: string; title?: string; size?: OverlaySize } & OverlayExtras)
+  | ({ kind: 'url'; url: string; title?: string; size?: OverlaySize } & OverlayExtras)
   /**
    * One of the plugin's own pages (plugin-relative path), loaded like a panel: the plugin's CSP,
    * the app theme and the panel SDK. The page answers with `ccPanel.post({ result: value })`,
    * which closes the overlay and resolves `open` with `{ kind: 'value', value }`. With
    * `overlay.start`, anything else it posts (no `result` key) goes to the handle's `onMessage`.
    */
-  | { kind: 'html'; file: string; title?: string; size?: OverlaySize }
+  | ({ kind: 'html'; file: string; title?: string; size?: OverlaySize } & OverlayExtras)
 
 export type OverlayResult =
   | { kind: 'exit'; code: number }
   | { kind: 'value'; value: JsonValue }
   | { kind: 'dismissed' }
+  /** The person used Discuss with Claude: the text went to Claude tab `tabId` (`queued`: it waits for the tab to be ready). */
+  | { kind: 'discussed'; tabId: string; queued: boolean }
 
 /** Options of `ctx.notify(text, options)`. Unknown keys are ignored. */
 export interface NotifyOptions {
@@ -200,7 +267,7 @@ export interface NotifyOptions {
   title?: string
   /**
    * A short sound from the project window (the same on every OS), unless the person turned off
-   * "Notification sounds" (Settings > Appearance and keys > Notifications). At most one chime per
+   * "Notification sounds" (Settings > General > Notifications). At most one chime per
    * 5 s per window, however many plugins ask. The OS notification itself is then silent.
    * - `true`: the app's sound, the one picked there under "Sound".
    * - a string: the value of one of this plugin's `"format": "sound"` settings fields, as it is
@@ -248,6 +315,21 @@ export interface OverlayHandle {
    * once it ended.
    */
   focus(): void
+  /** A click on one of the buttons the spec (or `setButtons`) gave, by its `id`. Dropped when the overlay ends. */
+  onButton(id: string, handler: () => unknown): Disposer
+  /** Replace the opener's buttons (a "Mark read" that became "Mark unread"). Same rules as `buttons` in the spec. A no-op once the overlay ended. */
+  setButtons(buttons: OverlayButton[]): void
+  /**
+   * Answer Discuss with Claude with the context text to send (within 5 s), or `null` for none. A
+   * throw or a timeout shows its error to the person and sends nothing.
+   */
+  onDiscuss(handler: () => Promise<{ text: string } | null> | { text: string } | null): Disposer
+  /**
+   * Draw Discuss with Claude as the toolbar's primary (accent) button, or plain again with `false`
+   * (the default): e.g. once the page holds something worth sending. Held until the overlay exists;
+   * a no-op once it ended or while Discuss is not shown. An older app has no such method.
+   */
+  setDiscussPrimary(on: boolean): void
 }
 
 export type SessionStatus = 'starting' | 'idle' | 'working' | 'needs-permission' | 'waiting' | 'ended'
@@ -266,6 +348,13 @@ export interface SessionInfo {
    * removed; what the Sessions panel and the tab strip name the tab. Absent until Claude has one.
    */
   readonly title?: string
+  /** The name the person (or a plugin, `ctx.sessions.rename`) gave the tab; shown instead of `title`. */
+  readonly name?: string
+  /**
+   * A one-line summary of the session (the app's "Session gist" setting, a short model run after each
+   * turn); absent while the setting is off or before the first one. An older app never sends it.
+   */
+  readonly gist?: string
   readonly notes: readonly string[]
   readonly steps?: { readonly done: number; readonly total: number }
   /**
@@ -283,6 +372,27 @@ export interface SessionInfo {
    * window itself may be in the background.
    */
   readonly active?: boolean
+}
+
+/**
+ * One Claude tab of any window (`ctx.sessions.list({ scope: 'all' })`, which needs the manifest's
+ * `"access": { "sessions": "all-windows" }`). Only what tells the tabs apart and what they are doing:
+ * never prompts, notes, files, cwd or terminal content.
+ */
+export interface SessionSummary {
+  readonly tabId: string
+  /** A tab of the caller's own window; its full `SessionInfo` is in `list()`. */
+  readonly own: boolean
+  /**
+   * The tab's project: its name, and its colour as a CSS value when it has one (`var(--cc-project-blue)`
+   * for a palette colour, a theme token panel pages have; `#rrggbb` for a custom one).
+   */
+  readonly project: { readonly name: string; readonly color?: string }
+  readonly status: SessionStatus
+  readonly tool?: string
+  readonly title?: string
+  /** The name the person gave the tab; shown instead of `title`. */
+  readonly name?: string
 }
 
 /** `delivered`: typed now (the tab was waiting for input); `queued`: sent at its next Stop. */
@@ -351,6 +461,50 @@ export interface PluginLogger {
   error(...args: unknown[]): void
 }
 
+/** A placement of `ctx.panels.slots`: where in the panel's column, how tall, and what the provider is told. */
+export interface SlotPlacement {
+  /** `^[a-z][a-z0-9-]{0,63}$`; one of the panel's manifest `slots`. */
+  type: string
+  position: 'top' | 'bottom'
+  /** Px, 24 to 600. */
+  height: number
+  /** Plain JSON, at most 4 KiB as JSON; only the provider sees it. */
+  params?: JsonValue
+}
+
+/** One open frame of a slot this plugin provides (`ctx.slots.onOpen`). */
+export interface SlotInstance {
+  /** Opaque, one per frame. */
+  readonly id: string
+  readonly type: string
+  /** What the frame sits in: another plugin's panel, or the app's top bar. */
+  readonly host: { kind: 'panel'; pluginId: string; panelId: string } | { kind: 'app'; place: 'top-bar' }
+  /** From the placement; untrusted for the provider (the placing plugin chose it). */
+  readonly params: JsonValue | undefined
+  /** JSON only, at most 1 MiB, to the slot's page (`ccPanel.onMessage`). Dropped once the frame closed. */
+  post(message: JsonValue): void
+  /** What the slot's page posts (`ccPanel.post`). */
+  onMessage(listener: (message: JsonValue) => void): Disposer
+  /** The frame ended: the host panel was hidden or reloaded, the placement removed, or the provider changed. */
+  onClose(listener: () => void): Disposer
+}
+
+/**
+ * One open html settings page of this plugin (`contributes.settings.page`, `ctx.settingsPage.onOpen`).
+ * The page has no settings API of its own: store what it edits yourself (`ctx.appStorage` for the
+ * app scope, `ctx.storage` for the project scope) and validate it. Never post secret values to it.
+ */
+export interface SettingsPageInstance {
+  /** Which settings page shows it: the plugin's global page (`app`) or This project (`project`). */
+  readonly scope: 'app' | 'project'
+  /** JSON only, at most 1 MiB, to the page (`ccPanel.onMessage`). Dropped once the page closed. */
+  post(message: JsonValue): void
+  /** What the page posts (`ccPanel.post`). */
+  onMessage(listener: (message: JsonValue) => void): Disposer
+  /** The page went: Settings closed or moved on, the page reloaded, or another page of this plugin opened. */
+  onClose(listener: () => void): Disposer
+}
+
 export interface PluginContext {
   /** The API major this context implements. */
   readonly api: typeof PLUGIN_API_VERSION
@@ -416,6 +570,47 @@ export interface PluginContext {
     header(panelId: string, header: { meta?: string; actions?: PanelHeaderAction[] } | null): void
     /** A click on one of the panel's header actions (not a busy or disabled one): its `id`. */
     onAction(panelId: string, listener: (actionId: string) => void): Disposer
+    /**
+     * Place slots (pages another plugin draws) in the column of one of this plugin's own panels:
+     * `position` is above (`top`) or below (`bottom`) the panel's own frame, `height` 24 to 600 px
+     * (rounded and clamped, then clamped to the provider's `minHeight`/`maxHeight`), `params` plain
+     * JSON of at most 4 KiB that only the provider sees. At most 4 placements; each `type` must be
+     * in that panel's manifest `slots` and not an app slot type such as `sessions-strip`. Each call
+     * replaces the whole set; `null` removes them. Who draws a type is the project's pick (none
+     * while several plugins provide it and none is picked); the frames of a hidden or collapsed
+     * panel are unmounted. Cleared when the plugin stops or reloads. Throws for an undeclared panel
+     * or type or a placement over the limits; a refusal from main is logged.
+     */
+    slots(panelId: string, placements: SlotPlacement[] | null): void
+  }
+  /**
+   * The provider side of slots: pages this plugin draws inside another plugin's panel or the
+   * app's chrome. The types it can draw are the ones in its manifest `contributes.slots`.
+   * Older apps have no `ctx.slots`: check `typeof ctx.slots === 'object'` first.
+   */
+  readonly slots: {
+    /**
+     * A frame of `type` opened (the page at the slot's `entry` is shown in it). Throws for a type
+     * not in `contributes.slots`. Listeners are dropped when the plugin stops.
+     */
+    onOpen(type: string, listener: (slot: SlotInstance) => void): Disposer
+    /**
+     * For a plugin that places slots: would a placement of `type` draw now, i.e. a provider is
+     * picked for this project and running. Asks the app, so it is a promise.
+     */
+    available(type: string): Promise<boolean>
+  }
+  /**
+   * The backend of the plugin's html settings page (manifest `contributes.settings.page`), shown
+   * under its schema form in Settings. One page of the plugin is open at a time.
+   * Older apps have no `ctx.settingsPage`: check `typeof ctx.settingsPage === 'object'` first.
+   */
+  readonly settingsPage: {
+    /**
+     * The page opened in this project's window (its port is connected). Throws when the manifest
+     * declares no `contributes.settings.page`. Listeners are dropped when the plugin stops.
+     */
+    onOpen(listener: (page: SettingsPageInstance) => void): Disposer
   }
   /**
    * Badge on one of this plugin's own panel icons: a count, a dot, or null to clear. Throws for a
@@ -468,13 +663,63 @@ export interface PluginContext {
      * without asking the page, so a page that keeps a draft should post it as it goes.
      */
     start(spec: OverlaySpec): OverlayHandle
+    /**
+     * Add buttons to every overlay of type `typeName` in this window, whoever opened it (an "Edit"
+     * on a `file`, a "Mark read" on your own `inbox-item`). When such an overlay opens, and again
+     * after each click on any of its buttons and when its opener replaces its own, `provider` is
+     * asked with the overlay's info and answers the buttons to show now (at most 4; `[]` for none).
+     * It has 500 ms: a slower or throwing provider is skipped (logged in your plugin's log). The
+     * info's data came from the opener, so check it (that an id is yours, that a path is inside the
+     * project), and before a button that acts on an account, check `opener` too (OverlayInfo). A click calls that button's `run` (it shows busy until it settles, at most 30 s);
+     * `{ close: true }` closes the overlay. Never reaches the overlay's page. Dropped when the plugin
+     * stops. Check `typeof ctx.overlay.buttons === 'function'` first: an older app has none.
+     */
+    buttons(
+      typeName: string,
+      provider: (overlay: OverlayInfo) => OverlayTypeButton[] | Promise<OverlayTypeButton[]>
+    ): Disposer
   }
 
   // sessions
   readonly sessions: {
-    list(): Promise<SessionInfo[]>
-    /** The whole list again whenever one of this window's Claude tabs changes (at most 4 per second). */
-    onChange(listener: (sessions: SessionInfo[]) => void): Disposer
+    /**
+     * This window's Claude tabs. `{ scope: 'all' }`: a summary of every window's Claude tabs instead,
+     * only with the manifest's `"access": { "sessions": "all-windows" }` (throws otherwise). An older
+     * app ignores the option and answers this window's tabs: check `typeof ctx.sessions.focus`.
+     */
+    list(options?: { scope?: 'window' }): Promise<SessionInfo[]>
+    list(options: { scope: 'all' }): Promise<SessionSummary[]>
+    /**
+     * The whole list again whenever one of this window's Claude tabs changes (at most 4 per second).
+     * `{ scope: 'all' }`: the summaries of every window whenever any Claude tab changes; the same
+     * declaration as `list`.
+     */
+    onChange(listener: (sessions: SessionInfo[]) => void, options?: { scope?: 'window' }): Disposer
+    onChange(listener: (sessions: SessionSummary[]) => void, options: { scope: 'all' }): Disposer
+    /**
+     * Select a Claude tab of any window, raising that window. False for an id that is no Claude tab
+     * (any more). At most 10 in 10 s.
+     */
+    focus(tabId: string): Promise<boolean>
+    /**
+     * Close a Claude tab of this window the way the person would: a running tab asks first (the close
+     * dialog, unless the person turned it off), in this window, which is raised for it. `closed: false`
+     * when they cancel or the dialog could not be shown. Rejects for a tab of another window. At most 10 a minute.
+     */
+    close(tabId: string): Promise<{ closed: boolean }>
+    /**
+     * Open one of a tab's changed `files` (an entry of its `SessionInfo.files`, verbatim) as the person's
+     * click would: the plugin picked to open files when it is inside the project, else the built-in
+     * viewer. Rejects for a tab of another window and a path that is not in the tab's list. At most 20 in 10 s.
+     */
+    openFile(tabId: string, path: string): Promise<void>
+    /**
+     * Name a Claude tab of this window (`SessionInfo.name`), shown in the tab strip and the Sessions
+     * panel instead of Claude's topic; `null` goes back to Claude's title. 1-60 characters without
+     * control, bidi or invisible format characters (rejects otherwise), and for a tab of this window only. The name survives a
+     * restart of the app. At most 30 a minute. An older app has no `rename`: check `typeof ctx.sessions.rename`.
+     */
+    rename(tabId: string, name: string | null): Promise<void>
     /**
      * Typed only while the tab is waiting for input; queued otherwise (delivered at a later Stop).
      * Rejects for a tab of another window, text starting with "/", "!", "#" or "&", and over 30 texts a minute.
@@ -483,8 +728,11 @@ export interface PluginContext {
     /**
      * A new Claude tab in this window; `cwd` must resolve inside the project folder, `prompt` is
      * passed as an argument, never typed (and may not start with "/", "!", "#" or "&"). At most 5 a minute.
+     * `focus: true` also selects the new tab in this window (for a click the person made, such as
+     * "Discuss in a new session"); without it the tab opens beside the one they are in, unselected.
+     * An older app ignores `focus`.
      */
-    open(options: { cwd?: string; prompt?: string }): Promise<{ tabId: string }>
+    open(options: { cwd?: string; prompt?: string; focus?: boolean }): Promise<{ tabId: string }>
   }
 
   // commands
@@ -560,7 +808,7 @@ export interface PluginContext {
  * keeps working across provider reloads and restarts. Arguments and results are copied as plain
  * data (structured clone): a function or symbol in them fails the call, a class instance arrives as
  * a plain object. A call waits for a still-activating provider; it rejects when no enabled plugin
- * provides the service, two do and none is picked in Settings > Plugins, the major versions differ,
+ * provides the service, two do and none is picked in Settings > This Project, the major versions differ,
  * the provider failed to activate or never called `provide`, the method does not exist, or the
  * provider threw (a fresh Error with its message). There is no timeout: race your own.
  */
@@ -604,10 +852,20 @@ export interface ServicesApi {
    */
   available(name: string): boolean
   /**
+   * The id of the plugin a call on service `name` would reach now (the only provider, or the
+   * project's pick among several), or `null` when none would: no enabled provider, several and no
+   * pick, or the selected one at another major. Same rule as a call and `available`, asked fresh on
+   * every call (call it when you need it, not once in `activate`). For checking who opened an overlay
+   * (`OverlayInfo.opener`) against the reviewer the project picked, say. Throws for a name not in
+   * this plugin's `services.uses`, and for one in its `services.collects` (the pick does not apply
+   * to a collector: `useAll(name).providers()`). An older app has no `provider`: feature-test it.
+   */
+  provider(name: string): string | null
+  /**
    * Every provider of service `name`, for a plugin that reads from all of them (Inbox collecting
    * each `inbox-feed`). `name` must be in both `services.uses` and `services.collects` (app 0.9.7+:
    * older apps refuse a manifest with `collects`). The project's provider pick does not apply, and
-   * the Plugins page offers no pick for a name only collectors use. Throws for an undeclared name.
+   * This Project offers no pick for a name only collectors use. Throws for an undeclared name.
    */
   useAll(name: string): ServiceSet
 }
