@@ -372,6 +372,15 @@ export interface SessionInfo {
    * window itself may be in the background.
    */
   readonly active?: boolean
+  /**
+   * `true` once the person typed or pasted into the tab's terminal: they took it over. Set on the
+   * first key or paste (a key before Enter counts), never by terminal reports the terminal sends by
+   * itself (focus on switching to the tab, mouse clicks and scrolls, replies to queries), nor by
+   * `ctx.sessions.send` or anything else the app types. Never cleared while the tab exists (a
+   * restart keeps it); not persisted, so a tab restored at app start is `false`. The flip reaches
+   * `onChange`. Always present on an app that detects it: an older app has no such field.
+   */
+  readonly typed: boolean
 }
 
 /**
@@ -407,6 +416,12 @@ export interface CliCall {
   readonly stdin: string
   /** The caller's working directory (absolute): resolve relative path arguments against it. */
   readonly cwd: string
+  /**
+   * The Claude tab that ran the command, set by the app from the caller's session token (never from its
+   * arguments), so `ccc` in that tab cannot name another. Absent when the caller is a shell tab, a command
+   * tab, a terminal overlay or outside a tab (`--project`), and on an app older than 0.11.
+   */
+  readonly tabId?: string
   /** Aborted when the call is cancelled: the caller pressed Ctrl+C, it timed out (30 s), or the plugin is deactivated. */
   readonly signal: AbortSignal
 }
@@ -730,9 +745,11 @@ export interface PluginContext {
      * passed as an argument, never typed (and may not start with "/", "!", "#" or "&"). At most 5 a minute.
      * `focus: true` also selects the new tab in this window (for a click the person made, such as
      * "Discuss in a new session"); without it the tab opens beside the one they are in, unselected.
-     * An older app ignores `focus`.
+     * `model` (`haiku`, `sonnet`, `opus` or `fable`) and `effort` (`low`, `medium`, `high`, `xhigh` or `max`) start
+     * the tab with `--model` / `--effort`; absent means the person's default, anything else rejects.
+     * An older app ignores `focus`, `model` and `effort`.
      */
-    open(options: { cwd?: string; prompt?: string; focus?: boolean }): Promise<{ tabId: string }>
+    open(options: { cwd?: string; prompt?: string; focus?: boolean; model?: string; effort?: string }): Promise<{ tabId: string }>
   }
 
   // commands
