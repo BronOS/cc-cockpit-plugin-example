@@ -381,6 +381,15 @@ export interface SessionInfo {
    * `onChange`. Always present on an app that detects it: an older app has no such field.
    */
   readonly typed: boolean
+  /**
+   * The person's flag on the tab: they marked it to come back to. `color` is one of `red`,
+   * `orange`, `yellow`, `green`, `blue`, `purple` (theme tokens `--cc-flag-<color>` in panel pages);
+   * `note` an optional reminder, 1 to 80 characters of plain text. Absent when the tab has none.
+   * Read-only: only the person sets or clears it (the tab's right-click menu, the Toggle Tab Flag
+   * command), no plugin API writes it. Sticky until cleared, kept across an app restart; a change
+   * reaches `onChange`. An older app never sends it.
+   */
+  readonly flag?: { readonly color: string; readonly note?: string }
 }
 
 /**
@@ -402,6 +411,8 @@ export interface SessionSummary {
   readonly title?: string
   /** The name the person gave the tab; shown instead of `title`. */
   readonly name?: string
+  /** The person's flag colour (SessionInfo.flag without its note, which stays in the tab's own window). */
+  readonly flag?: { readonly color: string }
 }
 
 /** `delivered`: typed now (the tab was waiting for input); `queued`: sent at its next Stop. */
@@ -750,6 +761,14 @@ export interface PluginContext {
      * An older app ignores `focus`, `model` and `effort`.
      */
     open(options: { cwd?: string; prompt?: string; focus?: boolean; model?: string; effort?: string }): Promise<{ tabId: string }>
+    /**
+     * A plain shell tab in this window, the kind the person gets from "+" > shell: their login shell,
+     * with no command, arguments or environment from the plugin and nothing typed into it. `cwd` must
+     * resolve inside the project folder (the folder itself when absent). `focus: true` selects it (for
+     * a click such as "Open terminal here"); without it the tab opens unselected. Counts against the
+     * same 5 a minute as `open`. An older app has no `openShell`: check `typeof ctx.sessions.openShell`.
+     */
+    openShell(options?: { cwd?: string; focus?: boolean }): Promise<{ tabId: string }>
   }
 
   // commands
@@ -791,6 +810,30 @@ export interface PluginContext {
      * dropped. Needs no manifest declaration; at most 20 calls per 10 s.
      */
     open(path: string, options?: { tabId?: string }): Promise<OpenFileResult>
+    /**
+     * Show a project file or folder selected in the system's file manager (Finder, Explorer, the
+     * desktop's file manager on Linux). `path` as for `open`, and `''` is the project folder itself
+     * (shown in its parent). Rejects for a path whose real path is outside the project or a missing
+     * one. At most 3 per 10 s. Check `typeof ctx.files.reveal === 'function'`: an older app has none.
+     */
+    reveal(path: string): Promise<void>
+    /**
+     * Open a project file with the system's default app for its type, as a double click in the file
+     * manager would. Rejects for what that would RUN instead of open: a folder (use `reveal`), a
+     * file with an exec bit, an app bundle (`.app`) or anything inside one, and the runnable types
+     * (`.command`, `.sh`, `.desktop`, `.AppImage`, `.exe`, `.bat`, `.ps1`, `.js`, `.jar` and the rest
+     * listed in `ccc guide api`, any case). Same path rules as `reveal`; at most 3 per 10 s.
+     */
+    openWithSystem(path: string): Promise<void>
+    /**
+     * Move a project file or folder to the system Trash (Recycle Bin on Windows), recoverable; there
+     * is no permanent delete. The app first asks the person in this window, naming the path relative
+     * to the project: it resolves once moved, and rejects with an Error named `AbortError` when they
+     * say no (nothing moved; show nothing). Rejects for the project folder itself, a path outside the
+     * project by its real path, while another of this window's trash dialogs is open, and past 10 a
+     * minute. A symlink is trashed as the link, never what it points to.
+     */
+    trash(path: string): Promise<void>
   }
 
   /**
