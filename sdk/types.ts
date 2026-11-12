@@ -8,9 +8,10 @@
 // refuses a manifest whose `api` major it does not know (src/shared/manifest.ts).
 //
 // The phase-1 host implements every member (src/host/ctx/). The page side of panels is the panel SDK
-// (src/sdk/panel.ts, loaded as `/__sdk/panel.js`). A page that loads it also gets the app theme on
-// `:root` and the app's component stylesheet (`.cc-btn`, `.cc-row`, `.cc-field`, ...; `ccc guide
-// style`), adopted first and inside `@layer cc`, so any rule of the page's own wins over it.
+// (src/sdk/panel.ts, loaded as `../__sdk/panel.js` from a page one folder deep: a URL relative to
+// the page, never root-absolute, which breaks over web access). A page that loads it also gets the
+// app theme on `:root` and the app's component stylesheet (`.cc-btn`, `.cc-row`, `.cc-field`, ...;
+// `ccc guide style`), adopted first and inside `@layer cc`, so any rule of the page's own wins over it.
 
 export const PLUGIN_API_VERSION = 1
 
@@ -426,6 +427,23 @@ export interface SessionSummary {
   readonly flag?: { readonly color: string }
 }
 
+/**
+ * Another machine (`ctx.sessions.machines`): a server this app has a remote window open on. `id` is
+ * opaque, minted by the app for this run (focusMachine takes it). The counts are the server's Claude
+ * tabs: `waiting` for the person (at the prompt or a permission dialog), `working` (or starting),
+ * `idle` (idle or exited). They are absent while the first answer is pending, for a server too old to
+ * answer them, and whenever `reachable` is false (the server did not answer).
+ */
+export interface MachineInfo {
+  readonly id: string
+  /** The person's own name for the server, or `Server <n>` (stable for the run) when they gave it none; never its address. */
+  readonly name: string
+  readonly reachable: boolean
+  readonly waiting?: number
+  readonly working?: number
+  readonly idle?: number
+}
+
 /** One rate-limit window of the person's Claude account (`RateLimits`). */
 export interface RateLimitWindow {
   /** How much of the window is used, 0-100. */
@@ -653,9 +671,20 @@ export interface PluginContext {
    * of the plugin's to talk to); `show` works for both kinds.
    */
   readonly panels: {
-    /** JSON only, at most 1 MiB. Dropped while the panel is not shown (it asks again when it connects). */
-    post(panelId: string, message: JsonValue): void
-    onMessage(panelId: string, listener: (message: JsonValue) => void): Disposer
+    /**
+     * JSON only, at most 1 MiB. Dropped while the panel is not shown (it asks again when it connects).
+     * With no `options` the message goes to the panel's page in every view (the desktop window and
+     * each browser showing the project): right for state pushes. `{ view }` (the `view` a listener
+     * got) sends to that one view's page: right for an answer to one page's request. A view that
+     * has no page of the panel any more drops the message; a `view` that is not one throws.
+     */
+    post(panelId: string, message: JsonValue, options?: { view?: string }): void
+    /**
+     * The second argument says which page posted: `view` is `'desktop'` for the desktop window's own
+     * page, else the id of a browser view (`web:<n>`). It stays valid for `post`'s `{ view }` after
+     * the listener returned. Calls the listener makes (`ctx.sessions.focus`) already act in that view.
+     */
+    onMessage(panelId: string, listener: (message: JsonValue, from: { view: string }) => void): Disposer
     /**
      * Bring one of this plugin's own panels (either kind, a `webview` one included) into sight: a
      * hidden panel comes back, a closed one opens, its zone expands. Throws for an undeclared id;
@@ -804,6 +833,21 @@ export interface PluginContext {
      */
     focus(tabId: string): Promise<boolean>
     /**
+     * The other machines: one entry per server this app has a remote window open on, with its Claude
+     * tabs as counts only (no session text crosses machines). Empty in server mode and when no remote
+     * window is open. The same `"access": { "sessions": "all-windows" }` declaration as
+     * `list({ scope: 'all' })` (throws otherwise). An older app has none: check
+     * `typeof ctx.sessions.machines === 'function'`.
+     */
+    machines(): Promise<MachineInfo[]>
+    /** The whole list again whenever it changes (a machine added or gone, a name, a count); the same declaration. */
+    onMachinesChange(listener: (machines: MachineInfo[]) => void): Disposer
+    /**
+     * Focus that machine's most recently focused remote window. False for an id that is not listed
+     * (any more). The same declaration; shares focus's limit (at most 10 in 10 s for both).
+     */
+    focusMachine(id: string): Promise<boolean>
+    /**
      * Close a Claude tab of this window the way the person would: a running tab asks first (the close
      * dialog, unless the person turned it off), in this window, which is raised for it. `closed: false`
      * when they cancel or the dialog could not be shown. Rejects for a tab of another window. At most 10 a minute.
@@ -914,6 +958,8 @@ export interface PluginContext {
      * desktop's file manager on Linux). `path` as for `open`, and `''` is the project folder itself
      * (shown in its parent). Rejects for a path whose real path is outside the project or a missing
      * one. At most 3 per 10 s. Check `typeof ctx.files.reveal === 'function'`: an older app has none.
+     * Rejects when the call came from a web access browser view (it acts on the host's screen); a
+     * page hides the item there with `ccPanel.view.remote`, a UI hint only, never a security check.
      */
     reveal(path: string): Promise<void>
     /**
@@ -921,7 +967,8 @@ export interface PluginContext {
      * manager would. Rejects for what that would RUN instead of open: a folder (use `reveal`), a
      * file with an exec bit, an app bundle (`.app`) or anything inside one, and the runnable types
      * (`.command`, `.sh`, `.desktop`, `.AppImage`, `.exe`, `.bat`, `.ps1`, `.js`, `.jar` and the rest
-     * listed in `ccc guide api`, any case). Same path rules as `reveal`; at most 3 per 10 s.
+     * listed in `ccc guide api`, any case). Same path rules as `reveal`; at most 3 per 10 s. Like
+     * `reveal`, rejects from a web access browser view (`ccPanel.view.remote` in the page).
      */
     openWithSystem(path: string): Promise<void>
     /**
