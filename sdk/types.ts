@@ -160,6 +160,42 @@ export interface ExecResult {
   stderr: string
 }
 
+/** `ctx.processes.spawn` options. */
+export interface ProcessSpawnOptions {
+  /** An existing directory; defaults to the project folder, a relative path is relative to it. */
+  cwd?: string
+}
+
+/** How a `ctx.processes` child ended: `code` null when a signal ended it (`kill()` included). */
+export interface ProcessExit {
+  code: number | null
+  signal: string | null
+}
+
+/**
+ * A long-running child of `ctx.processes.spawn`, with byte stdio (a language server's framing
+ * counts bytes). Listeners added in the same tick as the spawn miss nothing; output with no
+ * listener is dropped (it is always read, so a child never blocks on a pipe nobody reads).
+ */
+export interface PluginProcess {
+  /** The child's pid (it leads its own process group). */
+  readonly pid: number
+  /**
+   * Write bytes to its stdin. Ignored once the child has exited or `end()` was called; throws for
+   * anything but a Uint8Array (a Buffer is one) and when more than 64 MiB wait unread. There is no
+   * backpressure signal, so write each message (an LSP header and body) in one call.
+   */
+  write(bytes: Uint8Array): void
+  /** Close its stdin (a program that reads until EOF then finishes). */
+  end(): void
+  onData(listener: (bytes: Uint8Array) => void): Disposer
+  onStderr(listener: (bytes: Uint8Array) => void): Disposer
+  /** Once, after its output is delivered; a listener added after the exit is called soon after. */
+  onExit(listener: (exit: ProcessExit) => void): Disposer
+  /** SIGKILL the child and its whole process group. Nothing once it has exited. */
+  kill(): void
+}
+
 export type BadgeValue = number | 'dot' | null
 
 /**
@@ -402,6 +438,17 @@ export interface SessionInfo {
    * from the status line like `costUsd` and absent in the same cases.
    */
   readonly contextPercent?: number
+  /**
+   * The tab's room: the room's title, the tab's member name in it and
+   * whether it is a coordinator. Absent for a tab in no room. Set by the app only; a change reaches
+   * `onChange`. An older app never sends it.
+   */
+  readonly room?: { readonly title: string; readonly name: string; readonly coordinator: boolean }
+  /**
+   * How many room messages wait for this member (held until its `ccc room read`); absent when none
+   * do and for a tab in no room. Never the messages themselves. An older app never sends it.
+   */
+  readonly held?: number
 }
 
 /**
@@ -469,6 +516,100 @@ export interface RateLimits {
 
 /** `delivered`: typed now (the tab was waiting for input); `queued`: sent at its next Stop. */
 export type SendResult = { readonly delivered: true } | { readonly queued: true; readonly itemId: string }
+
+/**
+ * Open a new tab as a split pane beside a tab of this window (`ctx.sessions.open`, `openShell`,
+ * `openCommand`): `beside` is that tab's id, `side` puts the new pane to its right (the default) or
+ * below it. Only the new tab is placed; a plugin never moves, resizes or closes the person's panes. A
+ * plain tab becomes a group of the two; the anchor stays visible and keeps focus. Any tab of this
+ * window may be the anchor, a page tab (`ctx.tabs`) included; an unknown id and a tab of another
+ * window reject the same way, before the open counts against the 5 a minute. The open still succeeds
+ * as an ordinary tab (`placed: false`) when the anchor closed meanwhile, its group already has 4
+ * panes, or its terminal pane is too small to halve (a page anchor's size is not known to the app, so
+ * a small page pane is halved anyway). `focus: true` shows the anchor's group in
+ * the window the call came from; the new pane is never focused (it must not catch the person's keys).
+ * An older app ignores both and answers without `placed`.
+ */
+export interface OpenBeside {
+  beside?: string
+  side?: 'right' | 'down'
+}
+
+/** What an open answers: `placed` is set only when `beside` was given (and the app knows it). */
+export interface OpenedTab {
+  tabId: string
+  placed?: boolean
+}
+
+/** One of the plugin's rooms (`ctx.rooms.list`). The members' messages are never in it. */
+export interface RoomInfo {
+  /** Opaque; names the room in every other `ctx.rooms` call. */
+  readonly id: string
+  readonly title: string
+  /** Epoch ms. */
+  readonly createdAt: number
+  /** Set once the room ended (`ctx.rooms.end`, or the plugin was switched off, removed or revoked). */
+  readonly endedAt?: number
+  /** Paused by the person, by the loop guard or by a restart: nothing is delivered, sends still queue. */
+  readonly paused: boolean
+  /** How many members it has. */
+  readonly members: number
+}
+
+/** A member of a room (`ctx.rooms.members`). */
+export interface RoomMember {
+  readonly name: string
+  readonly coordinator: boolean
+  /** Its Claude tab now (a tab of this window); absent while it has none (after a quit, until a restore). */
+  readonly tabId?: string
+  /** Messages waiting for it. */
+  readonly held: number
+}
+
+/**
+ * What a room send did for one recipient: `delivered` (the pointer reached its session), `held` (queued; `why` is
+ * `paused`, `no-tab`, `typed`, `capped`, `draft` or `not-waiting`), `gone` (no member of that name: nothing queued) or
+ * `refused` (its queue is full: nothing queued for it).
+ */
+export type RoomSendAnswer =
+  | { readonly to: string; readonly path: 'delivered' }
+  | {
+      readonly to: string
+      readonly path: 'held'
+      readonly why: 'paused' | 'no-tab' | 'typed' | 'capped' | 'draft' | 'not-waiting'
+      readonly status?: SessionStatus
+    }
+  | { readonly to: string; readonly path: 'gone' }
+  | { readonly to: string; readonly path: 'refused'; readonly why: string }
+
+/** A doc of a room (`ctx.rooms.docs.list`): `shared/...` or `members/<name>/...`, and its size in bytes. */
+export interface RoomDoc {
+  readonly path: string
+  readonly size: number
+}
+
+/**
+ * One event of a room's log (`ctx.rooms.log`): `type` is `create`, `invite`, `join`, `leave`, `send`, `doc-read`,
+ * `doc-write`, `doc-refused`, `pause`, `resume`, `auto-pause`, `end` or `trimmed`; the other fields depend on it
+ * (`member`, `why`, `from`, `to`, `text`, `delivery`, `path`, ...). Message text is included.
+ */
+export interface RoomLogEntry {
+  /**
+   * The entry's number in its room, 1 up in the order logged, never reused: the cursor for `log`'s `since`. A gap
+   * means the log was trimmed (its oldest half dropped at 20 MiB, with a `trimmed` entry saying how many).
+   */
+  readonly seq: number
+  /** Epoch ms (several entries can share one: poll by `seq`, not by time). */
+  readonly at: number
+  readonly type: string
+  readonly [field: string]: unknown
+}
+
+/** One answer of `ctx.rooms.log`: `more` is true when entries were left out past `limit` (see `log`). */
+export interface RoomLogPage {
+  readonly entries: RoomLogEntry[]
+  readonly more: boolean
+}
 
 /** What a `ccc <name>` handler gets besides its arguments. */
 export interface CliCall {
@@ -583,6 +724,51 @@ export interface SettingsPageInstance {
   onClose(listener: () => void): Disposer
 }
 
+/**
+ * One connected frame of a page tab of this plugin (`contributes.tabs`, `ctx.tabs.onOpen`): the tab's
+ * page in one view (the desktop window, or a web access browser). The same tab can be open in
+ * several views at once, each its own instance with its own line; a host restart, a browser
+ * reconnecting or a slow browser catching up gives the SAME page a new line (a new instance; the old
+ * one's `onClose` runs first), never a reload, so the page re-sends what it holds (`ccPanel.onConnect`).
+ */
+export interface PageTabInstance {
+  /** The app's tab id: the same in every view and across reconnects, for the tab's life. */
+  readonly id: string
+  readonly type: string
+  /** The params the tab was opened with (plain JSON, at most 4 KiB), as the app saved them. */
+  readonly params: JsonValue | undefined
+  /** The web access view this frame is in (opaque); `undefined`: the desktop window. */
+  readonly view: string | undefined
+  /** JSON only, at most 1 MiB, to the tab's page in this view (`ccPanel.onMessage`). Dropped once the line ended. */
+  post(message: JsonValue): void
+  /** What the tab's page in this view posts (`ccPanel.post`). */
+  onMessage(listener: (message: JsonValue) => void): Disposer
+  /** The line ended: the tab closed, its frame was dropped in this view, or a new line replaced it. */
+  onClose(listener: () => void): Disposer
+  /**
+   * The tab's title (cut to 80 characters) and optionally its icon name; the app checks the tab is
+   * still yours and open. Rejects when refused or over the budget.
+   */
+  setTitle(title: string, icon?: string): Promise<void>
+  /**
+   * Ask Claude from this tab (the page calls `ccPanel.tab.discuss()`): the app draws the question box
+   * and asks this view's handlers for the context, in the order added; the first `{ text }` wins
+   * (the editor's `src/x.ts:40-52` and the selection, fenced), null passes on. A throw or another
+   * shape sends nothing. The app sends `About: <title>`, your text and the person's question to the
+   * Claude tab they picked, as their own text.
+   */
+  onDiscuss(handler: () => { text: string } | null | Promise<{ text: string } | null>): Disposer
+}
+
+/** A page tab as `ctx.tabs.list` gives it. */
+export interface PageTabInfo {
+  readonly id: string
+  readonly type: string
+  readonly params: JsonValue | undefined
+  readonly title: string
+  readonly icon?: string
+}
+
 /** A theme's terminal palette (`ctx.themes.set`, the `xterm` object of a theme file). Colour strings. */
 export interface XtermTheme {
   foreground?: string
@@ -663,6 +849,17 @@ export interface PluginContext {
   schedule(seconds: number, fn: () => unknown): Disposer
   /** Run argv (never through a shell); argv[0] is looked up on the login-shell PATH. */
   exec(argv: readonly string[], options?: ExecOptions): Promise<ExecResult>
+  /**
+   * Long-running processes with byte stdio (language servers, a headless tool talking over
+   * stdin/stdout). argv only, never a shell; the same PATH and env as `exec`. At most 16 running
+   * per plugin (spawn throws past that); every one is killed with its process group when the
+   * plugin stops or reloads and when the host stops. Not a permission: host code can start
+   * processes anyway. Older apps have no `ctx.processes`: check `typeof ctx.processes === 'object'`.
+   */
+  readonly processes: {
+    /** Start argv now; throws when argv[0] cannot be run or the cwd is not a directory. */
+    spawn(argv: readonly string[], options?: ProcessSpawnOptions): PluginProcess
+  }
 
   // UI
   /**
@@ -730,6 +927,45 @@ export interface PluginContext {
      * picked for this project and running. Asks the app, so it is a promise.
      */
     available(type: string): Promise<boolean>
+  }
+  /**
+   * Page tabs: tabs in the main tab bar whose content is this plugin's page (the types in the
+   * manifest's `contributes.tabs`; every call throws for another type). Older apps have no
+   * `ctx.tabs`: check `typeof ctx.tabs === 'object'` first.
+   */
+  readonly tabs: {
+    /**
+     * Open a page tab in this project's window and resolve its id. `params` plain JSON of at most 4
+     * KiB (what `onOpen` and the saved tab get back), `title` cut to 80 characters, `icon` a glyph
+     * name. `focus: true` selects it; otherwise it opens with the unseen dot. At most 64 page tabs
+     * per plugin per project, and a budget of opens per plugin; rejects when refused.
+     */
+    openPage(type: string, params: JsonValue | undefined, options: { title: string; icon?: string; focus?: boolean }): Promise<string>
+    /**
+     * A frame of a tab of `type` connected in a view (its page loaded, or got a new line): the
+     * listener gets that view's PageTabInstance. Listeners are dropped when the plugin stops.
+     */
+    onOpen(type: string, listener: (tab: PageTabInstance) => void): Disposer
+    /** This plugin's open page tabs of `type` in the project, in tab order. */
+    list(type: string): Promise<PageTabInfo[]>
+    /**
+     * Select one of this plugin's own page tabs of this project (an editor showing a file that already
+     * has a tab). Shares `openPage`'s budget; rejects for another plugin's tab or an unknown id.
+     */
+    focus(tabId: string): Promise<void>
+    /**
+     * Give one of this plugin's own page tabs of this project the unseen dot again without selecting it
+     * (an editor pointing at a file that already has a tab). `marked: false` when the window shows that
+     * tab now or it has the dot already. Shares `openPage`'s budget; rejects for another plugin's tab or
+     * an unknown id. Newer than `ctx.tabs` itself: check `typeof ctx.tabs.markUnseen === 'function'`.
+     */
+    markUnseen(tabId: string): Promise<{ marked: boolean }>
+    /**
+     * Close one of this plugin's own page tabs of this project the way the person would: a tab with
+     * unsaved changes in a view asks there first (the app's close dialog), so `closed: false` when
+     * they keep it or the ask could not be shown. Shares `ctx.sessions.close`'s limit (10 a minute).
+     */
+    close(tabId: string): Promise<{ closed: boolean }>
   }
   /**
    * The backend of the plugin's html settings page (manifest `contributes.settings.page`), shown
@@ -877,27 +1113,30 @@ export interface PluginContext {
     onRateLimits(listener: (rateLimits: RateLimits) => void): Disposer
     /**
      * Typed only while the tab is waiting for input; queued otherwise (delivered at a later Stop).
-     * Rejects for a tab of another window, text starting with "/", "!", "#" or "&", and over 30 texts a minute.
+     * Rejects for a tab of another window, text starting with "/", "!", "#" or "&", and over 30 texts a minute (the
+     * default `sendsPerMinute`; the person can change it in Settings > Plugins > Limits, and the error names the cap).
      */
     send(tabId: string, text: string): Promise<SendResult>
     /**
      * A new Claude tab in this window; `cwd` must resolve inside the project folder, `prompt` is
-     * passed as an argument, never typed (and may not start with "/", "!", "#" or "&"). At most 5 a minute.
+     * passed as an argument, never typed (and may not start with "/", "!", "#" or "&"). At most 5 a minute (the
+     * default `opensPerMinute`, shared with openShell, openCommand and rooms.open; the person can change it).
      * `focus: true` also selects the new tab in this window (for a click the person made, such as
      * "Discuss in a new session"); without it the tab opens beside the one they are in, unselected.
      * `model` (`haiku`, `sonnet`, `opus` or `fable`) and `effort` (`low`, `medium`, `high`, `xhigh` or `max`) start
      * the tab with `--model` / `--effort`; absent means the person's default, anything else rejects.
-     * An older app ignores `focus`, `model` and `effort`.
+     * An older app ignores `focus`, `model` and `effort`. `beside` / `side`: see `OpenBeside`.
      */
-    open(options: { cwd?: string; prompt?: string; focus?: boolean; model?: string; effort?: string }): Promise<{ tabId: string }>
+    open(options: { cwd?: string; prompt?: string; focus?: boolean; model?: string; effort?: string } & OpenBeside): Promise<OpenedTab>
     /**
      * A plain shell tab in this window, the kind the person gets from "+" > shell: their login shell,
      * with no command, arguments or environment from the plugin and nothing typed into it. `cwd` must
      * resolve inside the project folder (the folder itself when absent). `focus: true` selects it (for
      * a click such as "Open terminal here"); without it the tab opens unselected. Counts against the
      * same 5 a minute as `open`. An older app has no `openShell`: check `typeof ctx.sessions.openShell`.
+     * `beside` / `side`: see `OpenBeside`.
      */
-    openShell(options?: { cwd?: string; focus?: boolean }): Promise<{ tabId: string }>
+    openShell(options?: { cwd?: string; focus?: boolean } & OpenBeside): Promise<OpenedTab>
     /**
      * A command tab in this window running `argv` directly, with no shell: `argv[0]` is looked up on the
      * person's PATH and every element is one argument as is (1-64 strings of 1-4096 characters, no NUL).
@@ -910,8 +1149,72 @@ export interface PluginContext {
      * the default `tabExit` setting, so to keep output on screen wrap the command so it waits for a key.
      * Unselected unless `focus: true`. Counts against the same 5 a minute as `open` and `openShell`.
      * An older app has no `openCommand`: check `typeof ctx.sessions.openCommand === 'function'`.
+     * `beside` / `side`: see `OpenBeside`.
      */
-    openCommand(options: { argv: string[]; cwd?: string; title?: string; focus?: boolean }): Promise<{ tabId: string }>
+    openCommand(options: { argv: string[]; cwd?: string; title?: string; focus?: boolean } & OpenBeside): Promise<OpenedTab>
+  }
+
+  // rooms
+  /**
+   * Rooms (`ccc guide rooms`): Claude tabs of this window that message each other and share docs through `ccc room`.
+   * Every call acts on this plugin's own rooms of this window only; any other id rejects as "no such room". The app
+   * sets every identity and rule; a refusal rejects with an Error naming the method and the rule. An older app has
+   * no `rooms`: check `typeof ctx.rooms === 'object'`.
+   */
+  readonly rooms: {
+    /**
+     * A new room: `title` is 1-60 characters on one line with no quote, bracket, control or bidi character. At most 5
+     * not ended per plugin in a project, and at most 50 ended ones kept (past that, `delete` one first).
+     */
+    create(options: { title: string }): Promise<{ id: string }>
+    /** This plugin's rooms in this window, ended ones included (they stay until `delete`). */
+    list(): Promise<RoomInfo[]>
+    /** End a room: its members leave it (their tabs stay), invites die; its record and docs stay until `delete`. */
+    end(id: string): Promise<void>
+    /** Delete an ended room with its docs and log. */
+    delete(id: string): Promise<void>
+    /**
+     * A new Claude tab of this window that is a member from the start, under `name` (`^[a-z][a-z0-9-]{0,30}$`, not
+     * `all`, `plugin`, `person`, `user` or `system`; unique in the room). `cwd`, `prompt`, `model` and `effort` are
+     * `ctx.sessions.open`'s, with its checks, and it counts against the same 5 tabs a minute; the tab opens
+     * unselected. At most 20 members a room. Seed a member's kickoff doc before opening it.
+     */
+    open(
+      id: string,
+      options: { name: string; coordinator?: boolean; prompt?: string; model?: string; effort?: string; cwd?: string }
+    ): Promise<{ tabId: string }>
+    /**
+     * A one-time invite for `name`: hand `code` to an existing tab (through your own command), which joins by running
+     * `ccc room join <code>` itself. Single use, 10 minutes (`expiresAt`, epoch ms). A plugin can never pull a tab in.
+     */
+    invite(id: string, options: { name: string; coordinator?: boolean }): Promise<{ code: string; expiresAt: number }>
+    /** The room's members, with their tab now and how many messages wait for each. */
+    members(id: string): Promise<RoomMember[]>
+    /** Remove a member: its tab stays, out of the room; the messages waiting for it are dropped. */
+    remove(id: string, name: string): Promise<void>
+    /**
+     * A message `from plugin` to a member or `all` (every member): at most 20000 characters (more goes in a doc).
+     * The answer says per recipient what happened. Counts against the room's 60 sends a minute, every sender together
+     * (`all` once per recipient); a send over it rejects naming the cap. That cap and a member's 20 a minute are
+     * defaults the person can change (Settings > Plugins > Limits).
+     */
+    send(id: string, to: string, text: string): Promise<RoomSendAnswer[]>
+    /**
+     * The room's docs, every one of them (the plugin reads and writes all areas). A path is `shared/...` or
+     * `members/<name>/...` with at most four parts of `[A-Za-z0-9._-]` below the area; a doc is UTF-8 text of at most
+     * 256 KiB with no control, bidi or invisible format character but tab and line breaks; 20 MiB a room.
+     */
+    readonly docs: {
+      list(id: string): Promise<RoomDoc[]>
+      get(id: string, path: string): Promise<string>
+      put(id: string, path: string, text: string): Promise<void>
+    }
+    /**
+     * The room's events, oldest first, at most `limit` (default and most 1000). With `since` (a `seq`; 0 for the
+     * start) the OLDEST entries after it, and `more` true when newer ones remain: poll with the last `seq` you got,
+     * again at once while `more`. Without it the newest, `more` true when older ones were left out.
+     */
+    log(id: string, options?: { since?: number; limit?: number }): Promise<RoomLogPage>
   }
 
   // commands
@@ -938,7 +1241,7 @@ export interface PluginContext {
      * Needs `contributes.openFile` in the manifest (throws otherwise). Opens come only when the
      * project uses this plugin to open
      * files: it is the only enabled one declaring `openFile`, or the one picked in Settings >
-     * Plugins. Every listener is called; the app's built-in viewer opens instead when none is
+     * Plugins (with `openFile.whenPicked`, only the pick counts). Every listener is called; the app's built-in viewer opens instead when none is
      * registered, or each one throws or rejects within 1 s (a promise still pending then counts
      * as handled). The app waits at most 2 s for this host.
      */
@@ -980,6 +1283,19 @@ export interface PluginContext {
      * minute. A symlink is trashed as the link, never what it points to.
      */
     trash(path: string): Promise<void>
+    /**
+     * Download a project file or folder to the device of the web access browser view the person
+     * clicked in (a phone, a laptop's browser, the desktop's remote window). A file goes as itself, a
+     * folder as a `.zip` (`''` is the project folder), without its `.git` and `node_modules` folders
+     * unless `includeGitAndNodeModules` is true. Call it from the person's click in a panel, slot,
+     * overlay or settings page: it needs that browser view as the origin, and rejects with no origin
+     * (a timer, a plugin command, more than 10 s after the click) and from the desktop's own window
+     * (the file is already there, or a download needs a click in a browser view when one is attached). `path` as for `open`; a path whose real path is outside the project
+     * is refused, and so is a folder past 2 GiB of files or 20,000 entries. Resolves once the browser
+     * was handed the download (it shows the progress), rejects with a message to show the person.
+     * At most 10 per minute. Check `typeof ctx.files.download === 'function'`: an older app has none.
+     */
+    download(path: string, options?: { includeGitAndNodeModules?: boolean }): Promise<void>
   }
 
   /**
