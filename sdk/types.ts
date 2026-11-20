@@ -15,6 +15,21 @@
 
 export const PLUGIN_API_VERSION = 1
 
+/**
+ * Who is behind a view of a page (guests, design-guests §6): the owner of the machine, or a guest the
+ * owner invited, read-only or write. Main tags every port with it; a page's own claim is never used.
+ * A plugin that declares `"guests": { "aware": true }` promises to check it: show a guest only what the
+ * owner would share and refuse a read-only guest anything that changes state. Guests see a plugin only
+ * when the owner allows it (hidden by default).
+ */
+export type ViewAccess = 'owner' | 'read' | 'write'
+
+/** Which page a message or a click came from: its view (`'desktop'` or `web:<n>`) and that view's access. */
+export interface ViewFrom {
+  view: string
+  access: ViewAccess
+}
+
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 
 /** Undo a registration (a listener, a schedule, a command). Calling it twice is harmless. */
@@ -576,7 +591,7 @@ export interface RoomMember {
 
 /**
  * What a room send did for one recipient: `delivered` (the pointer reached its session), `held` (queued; `why` is
- * `paused`, `no-tab`, `typed`, `capped`, `draft` or `not-waiting`), `gone` (no member of that name: nothing queued) or
+ * `paused`, `no-tab`, `typed`, `capped`, `draft`, `not-waiting` or `idle`), `gone` (no member of that name: nothing queued) or
  * `refused` (its queue is full: nothing queued for it).
  */
 export type RoomSendAnswer =
@@ -584,7 +599,7 @@ export type RoomSendAnswer =
   | {
       readonly to: string
       readonly path: 'held'
-      readonly why: 'paused' | 'no-tab' | 'typed' | 'capped' | 'draft' | 'not-waiting'
+      readonly why: 'paused' | 'no-tab' | 'typed' | 'capped' | 'draft' | 'not-waiting' | 'idle'
       readonly status?: SessionStatus
     }
   | { readonly to: string; readonly path: 'gone' }
@@ -708,6 +723,8 @@ export interface SlotInstance {
   readonly host: { kind: 'panel'; pluginId: string; panelId: string } | { kind: 'app'; place: 'top-bar' }
   /** From the placement; untrusted for the provider (the placing plugin chose it). */
   readonly params: JsonValue | undefined
+  /** The access of the view this frame is in (fixed for the frame's life; a role switch opens a new frame). */
+  readonly access: ViewAccess
   /** JSON only, at most 1 MiB, to the slot's page (`ccPanel.onMessage`). Dropped once the frame closed. */
   post(message: JsonValue): void
   /** What the slot's page posts (`ccPanel.post`). */
@@ -747,6 +764,8 @@ export interface PageTabInstance {
   readonly params: JsonValue | undefined
   /** The web access view this frame is in (opaque); `undefined`: the desktop window. */
   readonly view: string | undefined
+  /** The access of that view (fixed for the instance's life; a role switch gives the page a new line). */
+  readonly access: ViewAccess
   /** JSON only, at most 1 MiB, to the tab's page in this view (`ccPanel.onMessage`). Dropped once the line ended. */
   post(message: JsonValue): void
   /** What the tab's page in this view posts (`ccPanel.post`). */
@@ -889,7 +908,7 @@ export interface PluginContext {
      * page, else the id of a browser view (`web:<n>`). It stays valid for `post`'s `{ view }` after
      * the listener returned. Calls the listener makes (`ctx.sessions.focus`) already act in that view.
      */
-    onMessage(panelId: string, listener: (message: JsonValue, from: { view: string }) => void): Disposer
+    onMessage(panelId: string, listener: (message: JsonValue, from: ViewFrom) => void): Disposer
     /**
      * Bring one of this plugin's own panels (either kind, a `webview` one included) into sight: a
      * hidden panel comes back, a closed one opens, its zone expands. Throws for an undeclared id;
@@ -905,7 +924,7 @@ export interface PluginContext {
      */
     header(panelId: string, header: { meta?: string; actions?: PanelHeaderAction[] } | null): void
     /** A click on one of the panel's header actions (not a busy or disabled one): its `id`. */
-    onAction(panelId: string, listener: (actionId: string) => void): Disposer
+    onAction(panelId: string, listener: (actionId: string, from: ViewFrom) => void): Disposer
     /**
      * Place slots (pages another plugin draws) in the column of one of this plugin's own panels:
      * `position` is above (`top`) or below (`bottom`) the panel's own frame, `height` 24 to 600 px
@@ -924,6 +943,18 @@ export interface PluginContext {
    * app's chrome. The types it can draw are the ones in its manifest `contributes.slots`.
    * Older apps have no `ctx.slots`: check `typeof ctx.slots === 'object'` first.
    */
+  /**
+   * The views this plugin's pages are open in, and each one's access (owner, read or write guest),
+   * learned from main's port tags: a view is known once one of its pages connected, gone when its last
+   * port closed. For posting owner-only data per view (`panels.post(id, msg, { view })`) instead of
+   * broadcasting. Older apps have no `ctx.views`: check `typeof ctx.views === 'object'` first.
+   */
+  readonly views: {
+    /** The view's access; undefined once it is gone (or never connected). Fixed for a view's life. */
+    access(view: string): ViewAccess | undefined
+    /** A view appeared (`access` set) or went (`access` undefined). */
+    onChange(listener: (e: { view: string; access: ViewAccess | undefined }) => void): Disposer
+  }
   readonly slots: {
     /**
      * A frame of `type` opened (the page at the slot's `entry` is shown in it). Throws for a type
@@ -1224,8 +1255,13 @@ export interface PluginContext {
     invite(id: string, options: { name: string; coordinator?: boolean }): Promise<{ code: string; expiresAt: number }>
     /** The room's members, with their tab now and how many messages wait for each. */
     members(id: string): Promise<RoomMember[]>
-    /** Remove a member: its tab stays, out of the room; the messages waiting for it are dropped. */
-    remove(id: string, name: string): Promise<void>
+    /**
+     * Remove a member: out of the room, the messages waiting for it dropped. Its tab stays, unless `closeTab: true`
+     * closes it with no dialog under the rule of `end`'s `closeTabs`: the app opened it for this room (`open`), not a
+     * coordinator's, not an invited member's, not one the person typed into. Resolves `{ closed }`, 1 when the tab was
+     * closed. An app older than this option ignores it and closes nothing (`closed: 0`).
+     */
+    remove(id: string, name: string, options?: { closeTab?: boolean }): Promise<{ closed: 0 | 1 }>
     /**
      * A message `from plugin` to a member or `all` (every member): at most 20000 characters (more goes in a doc).
      * The answer says per recipient what happened. Counts against the room's 60 sends a minute, every sender together
